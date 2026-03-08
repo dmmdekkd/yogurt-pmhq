@@ -8,10 +8,39 @@ import org.ntqqrev.acidify.event.SessionStoreUpdatedEvent
 import org.ntqqrev.acidify.exception.WtLoginException
 import org.ntqqrev.acidify.internal.crypto.pow.POW
 import org.ntqqrev.acidify.internal.crypto.tea.TEA
+import org.ntqqrev.acidify.internal.json.pmhq.PmhqLoginQrCodePayload
+import org.ntqqrev.acidify.common.PmhqSelfInfo
+import org.ntqqrev.acidify.internal.pmhq.system.GetQRCodePicture
+import org.ntqqrev.acidify.internal.pmhq.system.GetQuickLoginList
+import org.ntqqrev.acidify.internal.pmhq.system.GetSelfInfo
+import org.ntqqrev.acidify.internal.pmhq.listener.NodeIKernelLoginListener
+import org.ntqqrev.acidify.internal.pmhq.system.QuickLoginWithUin
 import org.ntqqrev.acidify.internal.proto.system.AndroidThirdPartyLoginResponse
 import org.ntqqrev.acidify.internal.service.system.WtLogin
 import org.ntqqrev.acidify.internal.util.*
 import org.ntqqrev.acidify.struct.QRCodeState
+import kotlin.io.encoding.Base64
+
+private suspend fun Bot.awaitPmhqOnline(queryInterval: Long, maxAttempts: Int): PmhqSelfInfo? {
+    repeat(maxAttempts) {
+        delay(queryInterval)
+        val selfInfo = client.packetContext.callService(GetSelfInfo)
+        if (selfInfo.online) {
+            return selfInfo
+        }
+    }
+    return null
+}
+
+private suspend fun Bot.completePmhqLogin(selfInfo: PmhqSelfInfo, preloadContacts: Boolean) {
+    val hasChanged = sessionStore.uin != selfInfo.uin || sessionStore.uid != selfInfo.uid
+    sessionStore.uin = selfInfo.uin
+    sessionStore.uid = selfInfo.uid
+    if (hasChanged) {
+        sharedEventFlow.emit(SessionStoreUpdatedEvent(sessionStore))
+    }
+    online(preloadContacts)
+}
 
 /**
  * 发起二维码登录请求。过程中会触发事件：
@@ -26,82 +55,127 @@ import org.ntqqrev.acidify.struct.QRCodeState
 suspend fun Bot.qrCodeLogin(queryInterval: Long = 3000L, preloadContacts: Boolean = false) {
     require(queryInterval >= 1000L) { "查询间隔不能小于 1000 毫秒" }
 
-    // Step 1: query QR code
-    val qrCode = client.callService(WtLogin.TransEmp.FetchQRCode)
-    client.sessionStore.qrSig = qrCode.qrSig
-    logger.i { "二维码 URL：${qrCode.qrCodeUrl}" }
-    sharedEventFlow.emit(QRCodeGeneratedEvent(qrCode.qrCodeUrl, qrCode.qrCodePng))
+    var qrState: QRCodeState
+    val listenerId = client.packetContext.addEventListener(object : NodeIKernelLoginListener() {
+        override suspend fun onQRCodeGetPicture(payload: PmhqLoginQrCodePayload) {
+            val base64 = payload.pngBase64QrcodeData.removePrefix("data:image/png;base64,")
+            qrState = QRCodeState.WAITING_FOR_SCAN
+            sharedEventFlow.emit(
+                QRCodeGeneratedEvent(
+                    url = payload.qrcodeUrl,
+                    png = Base64.decode(base64),
+                )
+            )
+        }
 
-    // Step 2: poll QR code state until confirmed / error
-    while (true) {
-        val result = client.callService(WtLogin.TransEmp.QueryQRCodeState)
-        val state = result.state
-        logger.d { "二维码状态：${state.name} (${state.value})" }
-        sharedEventFlow.emit(QRCodeStateQueryEvent(state))
-        when (result) {
-            is WtLogin.TransEmp.QueryQRCodeState.Result.Success -> {
-                logger.i { "二维码已确认，登录用户：${result.uin}" }
-                client.sessionStore.apply {
-                    uin = result.uin
-                    tgtgt = result.tgtgt
-                    encryptedA1 = result.encryptedA1
-                    noPicSig = result.noPicSig
-                }
-                break
-            }
+        override suspend fun onQRCodeLoginPollingStarted() {
+            qrState = QRCodeState.WAITING_FOR_SCAN
+        }
 
-            is WtLogin.TransEmp.QueryQRCodeState.Result.Other -> {
-                when (state) {
-                    QRCodeState.CODE_EXPIRED -> throw IllegalStateException("二维码已过期")
-                    QRCodeState.CANCELLED -> throw IllegalStateException("用户取消了登录")
-                    QRCodeState.UNKNOWN -> throw IllegalStateException("未知的二维码状态")
-                    else -> {} // pass
-                }
+        override suspend fun onQRCodeSessionUserScaned() {
+            qrState = QRCodeState.WAITING_FOR_CONFIRMATION
+        }
+
+        override suspend fun onQRCodeLoginSucceed() {
+            qrState = QRCodeState.CONFIRMED
+        }
+
+        override suspend fun onUserLoggedIn() {
+            qrState = QRCodeState.CONFIRMED
+        }
+
+        override suspend fun onQRCodeSessionFailed() {
+            qrState = QRCodeState.CODE_EXPIRED
+        }
+
+        override suspend fun onLoginFailed() {
+            qrState = QRCodeState.UNKNOWN
+        }
+
+        override suspend fun onQRCodeSessionQuickLoginFailed() {
+            qrState = QRCodeState.UNKNOWN
+        }
+    })
+
+    try {
+        val selfInfo = client.packetContext.callService(GetSelfInfo)
+        if (selfInfo.online) {
+            completePmhqLogin(selfInfo, preloadContacts)
+            return
+        }
+
+        qrState = QRCodeState.WAITING_FOR_SCAN
+        client.packetContext.callService(GetQRCodePicture)
+
+        while (true) {
+            sharedEventFlow.emit(QRCodeStateQueryEvent(qrState))
+            delay(queryInterval)
+
+            val polledSelfInfo = client.packetContext.callService(GetSelfInfo)
+            if (polledSelfInfo.online) {
+                qrState = QRCodeState.CONFIRMED
+                sharedEventFlow.emit(QRCodeStateQueryEvent(qrState))
+                completePmhqLogin(polledSelfInfo, preloadContacts)
+                return
             }
         }
-        delay(queryInterval)
+    } finally {
+        client.packetContext.removeEventListener(listenerId)
     }
-
-    // Step 3: get login credentials and complete login
-    val result = client.callService(WtLogin.PCLogin)
-    client.sessionStore.apply {
-        uid = result.uid
-        a2 = result.a2
-        d2 = result.d2
-        d2Key = result.d2Key
-        encryptedA1 = result.encryptedA1
-    }
-    sharedEventFlow.emit(SessionStoreUpdatedEvent(sessionStore))
-    online(preloadContacts)
 }
 
-
 /**
- * 如果 Session 为空则调用 [qrCodeLogin] 进行登录。
- * 如果 Session 不为空则尝试使用现有的 Session 信息登录，若失败则调用 [qrCodeLogin] 重新登录。
- * @param queryInterval 查询间隔（单位 ms），不能小于 `1000`
- * @param preloadContacts 是否预加载好友和群信息以初始化内存缓存
+ * 使用 PMHQ 提供的登录能力进行登录。
+ * 当 [quickLoginUin] 非空时，会优先检查当前登录态和快速登录列表，再在必要时回落到二维码登录。
  */
-suspend fun Bot.login(queryInterval: Long = 3000L, preloadContacts: Boolean = false) {
-    if (sessionStore.a2.isEmpty()) {
-        logger.i { "Session 为空，尝试二维码登录" }
-        qrCodeLogin(queryInterval, preloadContacts)
-    } else {
-        try {
-            try {
-                online(preloadContacts)
-            } catch (e: Exception) {
-                logger.w(e) { "使用现有 Session 登录失败，尝试刷新 DeviceGuid 后重新登录" }
-                sessionStore.refreshDeviceGuid()
-                online(preloadContacts)
+suspend fun Bot.login(
+    queryInterval: Long = 3000L,
+    preloadContacts: Boolean = false,
+    quickLoginUin: Long? = null,
+) {
+    require(queryInterval >= 1000L) { "查询间隔不能小于 1000 毫秒" }
+
+    val currentSelfInfo = client.packetContext.callService(GetSelfInfo)
+    if (currentSelfInfo.online) {
+        if (quickLoginUin == null || currentSelfInfo.uin == quickLoginUin) {
+            logger.d { "当前 QQ 实例已登录账号 ${currentSelfInfo.uin}" }
+            completePmhqLogin(currentSelfInfo, preloadContacts)
+            return
+        }
+        throw IllegalStateException(
+            "当前 QQ 实例已登录账号 ${currentSelfInfo.uin}，与要求的 uin $quickLoginUin 不匹配"
+        )
+    }
+
+    if (quickLoginUin != null) {
+        val quickLoginList = client.packetContext.callService(GetQuickLoginList)
+        val canQuickLogin = quickLoginList
+            ?.LocalLoginInfoList
+            ?.any { it.uin == quickLoginUin.toString() && it.isQuickLogin && !it.isUserLogin }
+            ?: false
+
+        if (canQuickLogin) {
+            logger.d { "尝试快速登录 $quickLoginUin" }
+            val quickLoginResult = client.packetContext.callService(QuickLoginWithUin, quickLoginUin)
+
+            if (quickLoginResult?.result == "0") {
+                val quickLoggedInSelfInfo = awaitPmhqOnline(queryInterval, maxAttempts = 20)
+                if (quickLoggedInSelfInfo != null) {
+                    if (quickLoggedInSelfInfo.uin != quickLoginUin) {
+                        throw IllegalStateException(
+                            "快速登录后 PMHQ 返回了 uin ${quickLoggedInSelfInfo.uin}，与要求的 uin $quickLoginUin 不匹配"
+                        )
+                    }
+                    completePmhqLogin(quickLoggedInSelfInfo, preloadContacts)
+                    return
+                }
             }
-        } catch (e: Exception) {
-            logger.w(e) { "使用现有 Session 登录失败，尝试二维码登录" }
-            sessionStore.clear()
-            // sharedEventFlow.emit(SessionStoreUpdatedEvent(sessionStore))
-            qrCodeLogin(queryInterval, preloadContacts)
+        } else {
+            logger.w { "找不到 $quickLoginUin 的快速登录信息，将进行二维码登录" }
         }
     }
+
+    qrCodeLogin(queryInterval, preloadContacts)
 }
 
 /**

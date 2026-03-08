@@ -12,7 +12,6 @@ import kotlinx.io.writeString
 import org.ntqqrev.acidify.*
 import org.ntqqrev.acidify.common.AppInfo
 import org.ntqqrev.acidify.common.SessionStore
-import org.ntqqrev.acidify.common.UrlSignProvider
 import org.ntqqrev.acidify.common.android.AndroidAppInfo
 import org.ntqqrev.acidify.common.android.AndroidSessionStore
 import org.ntqqrev.acidify.common.android.AndroidSignProvider
@@ -27,32 +26,17 @@ import org.ntqqrev.yogurt.util.AndroidLegacyUrlSignProvider
 import org.ntqqrev.yogurt.util.logHandler
 
 suspend fun Application.initializePC(): Bot {
-    val signProvider = UrlSignProvider(config.signApiUrl)
     val sessionStore: SessionStore = if (SystemFileSystem.exists(sessionStorePath)) {
         SystemFileSystem.source(sessionStorePath).buffered().use {
             SessionStore.fromJson(it.readString())
         }
     } else SessionStore.empty()
-    val appInfo: AppInfo = when (config.protocol.version) {
-        "fetched" -> signProvider.getAppInfo()
-            ?: throw IllegalStateException("通过 Sign API 获取 AppInfo 失败，请检查地址是否正确并且支持获取 AppInfo 功能")
-
-        "custom" -> if (SystemFileSystem.exists(customAppInfoPath)) {
-            SystemFileSystem.source(customAppInfoPath).buffered().use {
-                AppInfo.fromJson(it.readString())
-            }
-        } else {
-            throw IllegalStateException("未在 $customAppInfoPath 下找到自定义 AppInfo 文件")
-        }
-
-        else -> bundledPCAppInfo["${config.protocol.os}/${config.protocol.version}"]
-            ?: throw IllegalStateException("未找到匹配的内置 AppInfo，请检查配置的 OS 和 Version 是否正确")
-    }
+    val appInfo: AppInfo = AppInfo.Bundled.Linux
     t.println("使用协议 ${appInfo.os} ${appInfo.currentVersion} (AppId: ${appInfo.subAppId})")
     val bot = Bot(
         appInfo = appInfo,
         sessionStore = sessionStore,
-        signProvider = signProvider,
+        pmhqUrl = config.pmhqUrl,
         scope = this@initializePC, // application is a CoroutineScope
         minLogLevel = config.logging.coreLogLevel,
         logHandler = YogurtApp.logHandler,
@@ -151,7 +135,10 @@ suspend fun Application.initializeAndroid(): AndroidBot {
 
 suspend fun Application.botLogin() {
     when (val bot = dependencies.resolve<AbstractBot>()) {
-        is Bot -> bot.login(preloadContacts = config.preloadContacts)
+        is Bot -> bot.login(
+            preloadContacts = config.preloadContacts,
+            quickLoginUin = config.quickLoginUin,
+        )
         is AndroidBot -> {
             fun onRequireCaptchaTicket(captchaUrl: String): String {
                 val queryParams = captchaUrl.split("?")[1].replace("uin=0", "uin=${bot.uin}")
