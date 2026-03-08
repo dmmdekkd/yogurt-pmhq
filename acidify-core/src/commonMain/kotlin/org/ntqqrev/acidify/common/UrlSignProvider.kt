@@ -39,7 +39,14 @@ class UrlSignProvider(val url: String, val httpProxy: String? = null) : SignProv
         if (resp.status != HttpStatusCode.OK) {
             throw UrlSignException(resp.status.description, resp.status.value)
         }
-        val value = resp.body<UrlSignResponse>().value
+        val text = resp.bodyAsText()
+
+val obj = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+}.decodeFromString<UrlSignResponse>(text)
+
+val value = obj.value
         return SignResult(
             sign = value.sign.hexToByteArray(),
             token = value.token.hexToByteArray(),
